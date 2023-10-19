@@ -1,9 +1,10 @@
 use anyhow::Result;
 
-use std::{
-    convert::From,
-    io::{Write, Read, BufReader, BufRead},
-    net::{TcpListener, TcpStream}
+use std::convert::From;
+
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
 };
 
 #[derive(Debug, Clone)]
@@ -20,57 +21,56 @@ impl From<&str> for Command {
     }
 }
 
-fn read_command_from_connection(reader: &mut BufReader<TcpStream>) -> Result<Command> {
+async fn read_command_from_connection(reader: &mut BufReader<TcpStream>) -> Result<Command> {
     let mut buffer = String::with_capacity(1024);
 
     // TODO Properly parse and handle commands
     // Read number of array elements for command
-    reader.read_line(&mut buffer)?;
+    reader.read_line(&mut buffer).await?;
     buffer.clear();
     // Read command length
-    reader.read_line(&mut buffer)?;
+    reader.read_line(&mut buffer).await?;
     buffer.clear();
     // Read command name
-    reader.read_line(&mut buffer)?;
+    reader.read_line(&mut buffer).await?;
     buffer.clear();
 
     Ok(Command::PING)
 }
 
-fn handle_command(stream: &mut TcpStream, cmd: Command) -> Result<()> {
+async fn handle_command(stream: &mut TcpStream, cmd: Command) -> Result<()> {
     match cmd {
         Command::PING => {
-            stream.write_all(b"+PONG\r\n")?;
+            stream.write_all(b"+PONG\r\n").await?;
         }
     }
     Ok(())
 }
 
-fn handle_connection(stream: TcpStream) -> Result<()> {
+async fn handle_connection(stream: TcpStream) -> Result<()> {
     let mut reader = BufReader::new(stream);
     loop {
-        let command = read_command_from_connection(&mut reader)?;
-        handle_command(reader.get_mut(), command)?;
+        let command = read_command_from_connection(&mut reader).await?;
+        handle_command(reader.get_mut(), command).await?;
     }
 
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     eprintln!("Logs from your program will appear here!");
 
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:6379").await?;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                println!("accepted new connection");
-                handle_connection(stream)?;
+    loop {
+        let (socket, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(socket).await {
+                println!("an error occurred; error = {:?}", e);
             }
-            Err(e) => {
-                println!("error: {}", e);
-            }
-        }
+        });
     }
+    #[allow(unreachable_code)  ]
     Ok(())
 }
