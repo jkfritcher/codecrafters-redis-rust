@@ -12,7 +12,14 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::RwLock,
+    time::{Duration, Instant},
 };
+
+#[derive(Debug, Clone)]
+struct DataStoreValue {
+    value: Vec<u8>,
+    expiry: Option<Instant>,
+}
 
 #[derive(Debug, Clone)]
 enum Command {
@@ -21,6 +28,7 @@ enum Command {
     ECHO(Vec<u8>),
     GET(Vec<u8>),
     SET(Vec<u8>, Vec<u8>),
+    SETPX(Vec<u8>, Vec<u8>, Duration),
 }
 
 impl From<DataType> for Command {
@@ -57,8 +65,8 @@ impl From<DataType> for Command {
                         Command::GET(key.clone())
                     }
                     "set" => {
-                        if args.len() != 3 {
-                            return Command::INVALID("Invalid data type for command. must be an array of length 3".to_string());
+                        if args.len() != 3 && args.len() != 5 {
+                            return Command::INVALID("Invalid data type for command. must be an array of length 3 or 5".to_string());
                         }
                         let key = match args[1] {
                             DataType::BulkString(ref key) => key,
@@ -68,7 +76,28 @@ impl From<DataType> for Command {
                             DataType::BulkString(ref value) => value,
                             _ => { return Command::INVALID("Invalid data type for command. must be a bulk string".to_string()); }
                         };
-                        Command::SET(key.clone(), value.clone())
+                        match args.len() {
+                            3 => { Command::SET(key.clone(), value.clone()) }
+                            5 => {
+                                let arg = match args[3] {
+                                    DataType::BulkString(ref arg) => arg,
+                                    _ => { return Command::INVALID("Invalid data type for command. must be a bulk string".to_string()); }
+                                };
+                                match arg.as_slice() {
+                                    b"px" => (),
+                                    _ => { return Command::INVALID("Invalid argument for command. PX is only accepted argument name".to_string()); }
+                                };
+                                let expiry = match args[4] {
+                                    DataType::BulkString(ref expiry) => {
+                                        let expiry = String::from_utf8_lossy(expiry).parse::<u64>().unwrap();
+                                        Duration::from_millis(expiry)
+                                    },
+                                    _ => { return Command::INVALID("Invalid data type for command. PX argument must be a bulk string".to_string()); }
+                                };
+                                Command::SETPX(key.clone(), value.clone(), expiry)
+                            }
+                            _ => { todo!(); }
+                        }
                     }
                     _ => { todo!(); }
                 }
@@ -128,7 +157,7 @@ async fn get_next_command(reader: &mut BufReader<TcpStream>) -> Result<Command> 
     Ok(Command::from(data))
 }
 
-async fn handle_command(stream: &mut TcpStream, cmd: Command, datastore: &Arc<RwLock<HashMap<Vec<u8>,Vec<u8>>>>) -> Result<()> {
+async fn handle_command(stream: &mut TcpStream, cmd: Command, datastore: &Arc<RwLock<HashMap<Vec<u8>,DataStoreValue>>>) -> Result<()> {
     match cmd {
         Command::PING => {
             stream.write_all(b"+PONG\r\n").await?;
@@ -142,11 +171,28 @@ async fn handle_command(stream: &mut TcpStream, cmd: Command, datastore: &Arc<Rw
         Command::GET(key) => {
             let ds = datastore.as_ref().read().await;
             match ds.get(&key) {
-                Some(value) => {
-                    let len = value.len();
-                    stream.write_all(format!("${}\r\n", len).as_bytes()).await?;
-                    stream.write_all(&value).await?;
-                    stream.write_all("\r\n".as_bytes()).await?;
+                Some(dsv) => {
+                    match dsv.expiry {
+                        Some(expiry) => {
+                            if expiry < Instant::now() {
+                                drop(ds);
+                                let mut ds = datastore.as_ref().write().await;
+                                ds.remove(&key);
+                                stream.write_all(b"$-1\r\n").await?;
+                            } else {
+                                let len = dsv.value.len();
+                                stream.write_all(format!("${}\r\n", len).as_bytes()).await?;
+                                stream.write_all(&dsv.value).await?;
+                                stream.write_all("\r\n".as_bytes()).await?;
+                            }
+                        }
+                        None => {
+                            let len = dsv.value.len();
+                            stream.write_all(format!("${}\r\n", len).as_bytes()).await?;
+                            stream.write_all(&dsv.value).await?;
+                            stream.write_all("\r\n".as_bytes()).await?;
+                        }
+                    }
                 }
                 None => {
                     stream.write_all(b"$-1\r\n").await?;
@@ -155,7 +201,20 @@ async fn handle_command(stream: &mut TcpStream, cmd: Command, datastore: &Arc<Rw
         }
         Command::SET(key, value) => {
             let mut ds = datastore.as_ref().write().await;
-            ds.insert(key, value);
+            let dsv = DataStoreValue {
+                value: value,
+                expiry: None,
+            };
+            ds.insert(key, dsv);
+            stream.write_all(b"+OK\r\n").await?;
+        }
+        Command::SETPX(key, value, expiry) => {
+            let mut ds = datastore.as_ref().write().await;
+            let dsv = DataStoreValue {
+                value: value,
+                expiry: Some(Instant::now() + expiry),
+            };
+            ds.insert(key, dsv);
             stream.write_all(b"+OK\r\n").await?;
         }
         Command::INVALID(msg) => {
@@ -165,7 +224,7 @@ async fn handle_command(stream: &mut TcpStream, cmd: Command, datastore: &Arc<Rw
     Ok(())
 }
 
-async fn handle_connection(stream: TcpStream, datastore: Arc< RwLock< HashMap<Vec<u8>,Vec<u8>> > >) -> Result<()> {
+async fn handle_connection(stream: TcpStream, datastore: Arc<RwLock<HashMap<Vec<u8>,DataStoreValue>>>) -> Result<()> {
     let mut reader = BufReader::new(stream);
     loop {
         let command = get_next_command(&mut reader).await?;
