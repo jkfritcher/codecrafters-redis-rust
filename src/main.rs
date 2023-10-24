@@ -5,7 +5,7 @@ use futures::future::{BoxFuture, FutureExt};
 use std::{
     collections::HashMap,
     convert::From,
-    sync::Arc,
+    sync::Arc, path::PathBuf, os::unix::prelude::OsStrExt,
 };
 
 use tokio::{
@@ -21,6 +21,27 @@ struct DataStoreValue {
     expiry: Option<Instant>,
 }
 
+struct State {
+    datastore: HashMap<Vec<u8>,DataStoreValue>,
+    rdb_path: Option<PathBuf>,
+}
+
+impl State {
+    fn new() -> Self {
+        State {
+            datastore: HashMap::new(),
+            rdb_path: None,
+        }
+    }
+
+    fn new_with_rdbpath(rdb_path: PathBuf) -> Self {
+        State {
+            datastore: HashMap::new(),
+            rdb_path: Some(rdb_path),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Command {
     INVALID(String),
@@ -29,6 +50,7 @@ enum Command {
     GET(Vec<u8>),
     SET(Vec<u8>, Vec<u8>),
     SETPX(Vec<u8>, Vec<u8>, Duration),
+    CONFIGGET(Vec<u8>),
 }
 
 impl From<DataType> for Command {
@@ -99,6 +121,24 @@ impl From<DataType> for Command {
                             _ => { todo!(); }
                         }
                     }
+                    "config" => {
+                        if args.len() != 3 {
+                            return Command::INVALID("Invalid data type for command. must be an array of length 3".to_string());
+                        }
+                        let arg = match args[1] {
+                            DataType::BulkString(ref arg) => arg,
+                            _ => { return Command::INVALID("Invalid data type for command. must be a bulk string".to_string()); }
+                        };
+                        match arg.as_slice() {
+                            b"get" => (),
+                            _ => { return Command::INVALID("Invalid argument for command. GET is only accepted argument name".to_string()); }
+                        };
+                        let key = match args[2] {
+                            DataType::BulkString(ref key) => key,
+                            _ => { return Command::INVALID("Invalid data type for command. GET argument must be a bulk string".to_string()); }
+                        };
+                        Command::CONFIGGET(key.clone())
+                    }
                     _ => { todo!(); }
                 }
             }
@@ -157,7 +197,7 @@ async fn get_next_command(reader: &mut BufReader<TcpStream>) -> Result<Command> 
     Ok(Command::from(data))
 }
 
-async fn handle_command(stream: &mut TcpStream, cmd: Command, datastore: &Arc<RwLock<HashMap<Vec<u8>,DataStoreValue>>>) -> Result<()> {
+async fn handle_command(stream: &mut TcpStream, cmd: Command, state: &Arc<RwLock<State>>) -> Result<()> {
     match cmd {
         Command::PING => {
             stream.write_all(b"+PONG\r\n").await?;
@@ -169,14 +209,16 @@ async fn handle_command(stream: &mut TcpStream, cmd: Command, datastore: &Arc<Rw
             stream.write_all("\r\n".as_bytes()).await?;
         }
         Command::GET(key) => {
-            let ds = datastore.as_ref().read().await;
+            let state_ro = state.as_ref().read().await;
+            let ds = &state_ro.datastore;
             match ds.get(&key) {
                 Some(dsv) => {
                     match dsv.expiry {
                         Some(expiry) => {
                             if expiry < Instant::now() {
-                                drop(ds);
-                                let mut ds = datastore.as_ref().write().await;
+                                drop(state_ro);
+                                let mut state_rw = state.as_ref().write().await;
+                                let ds = &mut state_rw.datastore;
                                 ds.remove(&key);
                                 stream.write_all(b"$-1\r\n").await?;
                             } else {
@@ -200,7 +242,8 @@ async fn handle_command(stream: &mut TcpStream, cmd: Command, datastore: &Arc<Rw
             }
         }
         Command::SET(key, value) => {
-            let mut ds = datastore.as_ref().write().await;
+            let mut state = state.as_ref().write().await;
+            let ds = &mut state.datastore;
             let dsv = DataStoreValue {
                 value: value,
                 expiry: None,
@@ -209,13 +252,39 @@ async fn handle_command(stream: &mut TcpStream, cmd: Command, datastore: &Arc<Rw
             stream.write_all(b"+OK\r\n").await?;
         }
         Command::SETPX(key, value, expiry) => {
-            let mut ds = datastore.as_ref().write().await;
+            let mut state = state.as_ref().write().await;
+            let ds = &mut state.datastore;
             let dsv = DataStoreValue {
                 value: value,
                 expiry: Some(Instant::now() + expiry),
             };
             ds.insert(key, dsv);
             stream.write_all(b"+OK\r\n").await?;
+        }
+        Command::CONFIGGET(key) => {
+            let state_ro = state.as_ref().read().await;
+            let rdbpath = state_ro.rdb_path.as_ref().unwrap();
+            match key.as_slice() {
+                b"dir" => {
+                    let dir = rdbpath.parent().unwrap().as_os_str();
+                    stream.write_all(b"*2\r\n").await?;
+                    stream.write_all(b"$3\r\ndir\r\n").await?;
+                    stream.write_all(format!("${}\r\n", dir.len()).as_bytes()).await?;
+                    stream.write_all(dir.as_bytes()).await?;
+                    stream.write_all(b"\r\n").await?;
+                }
+                b"dbfilename" => {
+                    let filename = rdbpath.file_name().unwrap();
+                    stream.write_all(b"*2\r\n").await?;
+                    stream.write_all(b"$10\r\ndbfilename\r\n").await?;
+                    stream.write_all(format!("${}\r\n", filename.len()).as_bytes()).await?;
+                    stream.write_all(filename.as_bytes()).await?;
+                    stream.write_all(b"\r\n").await?;
+                }
+                _ => {
+                    stream.write_all(b"$-1\r\n").await?;
+                }
+            }
         }
         Command::INVALID(msg) => {
             stream.write_all(format!("-{}\r\n", msg).as_bytes()).await?;
@@ -224,11 +293,11 @@ async fn handle_command(stream: &mut TcpStream, cmd: Command, datastore: &Arc<Rw
     Ok(())
 }
 
-async fn handle_connection(stream: TcpStream, datastore: Arc<RwLock<HashMap<Vec<u8>,DataStoreValue>>>) -> Result<()> {
+async fn handle_connection(stream: TcpStream, state: Arc<RwLock<State>>) -> Result<()> {
     let mut reader = BufReader::new(stream);
     loop {
         let command = get_next_command(&mut reader).await?;
-        handle_command(reader.get_mut(), command, &datastore).await?;
+        handle_command(reader.get_mut(), command, &state).await?;
     }
 
     #[allow(unreachable_code)]
@@ -239,16 +308,44 @@ async fn handle_connection(stream: TcpStream, datastore: Arc<RwLock<HashMap<Vec<
 async fn main() -> Result<()> {
     eprintln!("Logs from your program will appear here!");
 
-    let listener = TcpListener::bind("127.0.0.1:6379").await?;
+    let mut rdb_dir: Option<String> = None;
+    let mut rdb_filename: Option<String> = None;
 
-    // Initialize datastore
-    let datastore = Arc::new(RwLock::new(HashMap::new()));
+    // Iterate over command line arguments
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--dir" => {
+                rdb_dir = args.next().clone();
+            }
+            "--dbfilename" => {
+                rdb_filename = args.next().clone();
+            }
+            _ => {
+                println!("Unknown argument: {}", arg);
+                return Ok(());
+            }
+        }
+    }
+
+    let state;
+    if rdb_dir.is_some() {
+        // Build rdb pathbuf
+        let mut rdb_file = PathBuf::from(rdb_dir.unwrap());
+        rdb_file.push(rdb_filename.unwrap_or("dump.rdb".to_string()));
+
+        state = Arc::new(RwLock::new(State::new_with_rdbpath(rdb_file)));
+    } else {
+        state = Arc::new(RwLock::new(State::new()));
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:6379").await?;
     loop {
         // Clone the datastore to be captured by the closure
-        let datastore = datastore.clone();
+        let state = state.clone();
         let (socket, _) = listener.accept().await?;
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, datastore).await {
+            if let Err(e) = handle_connection(socket, state).await {
                 println!("an error occurred; error = {:?}", e);
             }
         });
